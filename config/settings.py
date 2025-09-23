@@ -22,25 +22,33 @@ class SpreadsheetId(BaseModel):
         return getattr(self, region.value)
 
 
-# class Business(BaseModel):
-#     title: dict[str, str]
-#     real_units: list[str]
-#
-#
-# class Sellerboard(BaseModel):
-#     current: CellsRange
-#     update: CellsRange
-#
-#
-# class Amazon(BaseModel): ...
-
 class Helium(BaseModel):
     account_id: int
     auth_token: SecretStr
-    pacvue_token: SecretStr
+    pacvue_access_token: SecretStr
+    cells_range: list[str]
 
 
-# class SNS(BaseModel): ...
+class Sellerboard(BaseModel):
+    current_cells_range: list[str]
+    historical_cells_range: list[str]
+
+
+class Sns(BaseModel):
+    cells_range: list[str]
+
+
+class Business(BaseModel):
+    current_cells_range: list[str]
+    historical_cells_range: list[str]
+    title: dict[str, str]
+
+    def title_by_region(self, region: Region) -> str:
+        return self.title.get(region.value)
+
+
+class Campaigns(BaseModel):
+    cells_range: list[str]
 
 
 class AppSettings(BaseSettings):
@@ -48,6 +56,10 @@ class AppSettings(BaseSettings):
     update_offset: int
     spreadsheet_id: SpreadsheetId
     helium: Helium
+    sellerboard: Sellerboard
+    sns: Sns
+    business: Business
+    campaigns: Campaigns
 
     model_config = SettingsConfigDict(
         env_file=".env",

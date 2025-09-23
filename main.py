@@ -1,12 +1,18 @@
-import calendar
 import datetime
+import traceback
+from collections.abc import Callable
 from pathlib import Path
+from typing import Optional
 
-from amazon.sns import load_sns_data
+import helium
+import sellerboard
+import spreadsheets
+from amazon import business, campaign, sns
 from cmd_args import parse_arguments
-from config.products import load_products
+from config.products import get_tuesday_target_date, load_products
 from config.settings import AppSettings, app_settings
 from models import Product, Region
+from pretty_print import StepTimer, err, info, ok
 
 app_settings.set(AppSettings.load())
 
@@ -14,36 +20,47 @@ app_settings.set(AppSettings.load())
 today = datetime.date.today()
 DEFAULT_FILEPATH = Path.home().joinpath(
     "Downloads",
-    f"{today.strftime('%m')} {calendar.month_name[today.month].lower()}",
+    f"{today.strftime('%m %B').lower()}",
     f"{today.strftime('%d.%m.%Y')}",
 )
 
 # Default filenames for various data sources
-DEFAULT_SELLERBOARD_FILENAME = 'dashboard_entries.xlsx'
-DEFAULT_SELLERBOARD_UPDATE_FILENAME = 'dashboard_entries_update.xlsx'
-DEFAULT_BUSINESS_REPORT_FILENAME = 'BusinessReport.csv'
-DEFAULT_BUSINESS_REPORT_UPDATE_FILENAME = 'BusinessReport_update.csv'
-DEFAULT_CAMPAIGNS_FILENAME = 'Campaigns.csv'
-DEFAULT_SNS_PERFORMANCE_FILENAME = 'sns_performance_report.csv'
-DEFAULT_SNS_PRODUCTS_FILENAME = 'sns_manage_products.csv'
+DEFAULT_SELLERBOARD_FILENAME = "dashboard_entries.xlsx"
+DEFAULT_SELLERBOARD_UPDATE_FILENAME = "dashboard_entries_update.xlsx"
+DEFAULT_BUSINESS_REPORT_FILENAME = "BusinessReport.csv"
+DEFAULT_BUSINESS_REPORT_UPDATE_FILENAME = "BusinessReport_update.csv"
+DEFAULT_CAMPAIGNS_FILENAME = "Campaigns.csv"
+DEFAULT_SNS_PERFORMANCE_FILENAME = "sns_performance_report.csv"
+DEFAULT_SNS_PRODUCTS_FILENAME = "sns_manage_products.csv"
 
 
-def update_sellerboard_data(filepath: str, products: list[Product], region: Region, is_update=False):
-    """
-    Load and process Sellerboard data for revenue and advertising metrics.
+def _run_phase(
+    region: Region,
+    label: str,
+    load_fn: Callable[[], None],
+    add_fn: Optional[Callable[[], None]] = None,
+) -> bool:
+    try:
+        with StepTimer(f"[{region.value}] {label} — load"):
+            load_fn()
+    except Exception as e:
+        err(f"[{region.value}][{label}] load failed: {e}")
+        return False
+    if add_fn is None:
+        ok(f"[{region.value}][{label}] load ok")
+        return True
+    try:
+        with StepTimer(f"[{region.value}] {label} — add"):
+            add_fn()
+    except Exception as e:
+        err(f"[{region.value}][{label}] add failed: {e}")
+        return False
 
-    Args:
-        filepath: Directory path containing Sellerboard files
-        products: List of Product objects to update
-        region: Target region for data processing
-        is_update: Whether to process update data or ongoing data
-    """
-    filename = f'{filepath}{region.name}_{DEFAULT_SELLERBOARD_UPDATE_FILENAME if is_update else DEFAULT_SELLERBOARD_FILENAME}'
-    # load_sellerboard_data(filename, products, is_update)
-    # add_sellerboard_data(products, region, is_update)
+    ok(f"[{region.value}][{label}] completed")
+    return True
 
 
-def process_sellerboard_data(args, filepath: str, products: list[Product], region: Region):
+def process_sellerboard(args, filepath: Path, products: list[Product], region: Region) -> None:
     """
     Conditionally process Sellerboard data based on command line arguments.
 
@@ -53,36 +70,30 @@ def process_sellerboard_data(args, filepath: str, products: list[Product], regio
         products: List of Product objects
         region: Target region for processing
     """
-    if args.sellerboard or not any([args.business, args.helium, args.campaigns, args.sns]):
-        if args.ongoing or not args.update:
-            update_sellerboard_data(filepath, products, region, False)
-        if args.update or not args.ongoing:
-            update_sellerboard_data(filepath, products, region, True)
+    if not (args.sellerboard or not any([args.business, args.helium, args.campaigns, args.sns])):
+        return
+
+    if args.ongoing or not args.update:
+        _run_phase(
+            region,
+            "SB current",
+            lambda: sellerboard.load_current_data(
+                filepath.joinpath(f"{region.value}_{DEFAULT_SELLERBOARD_FILENAME}"), products,
+            ),
+            lambda: spreadsheets.add_current_sellerboard_data(products, region),
+        )
+    if args.update or not args.ongoing:
+        _run_phase(
+            region,
+            "SB historical",
+            lambda: sellerboard.load_historical_data(
+                filepath.joinpath(f"{region.value}_{DEFAULT_SELLERBOARD_UPDATE_FILENAME}"), products,
+            ),
+            lambda: spreadsheets.add_historical_sellerboard_data(products, region),
+        )
 
 
-def update_business_data(filepath: str, products: list[Product], region: Region, is_update=False):
-    """
-    Load and process Amazon Business Report data for sales and inventory metrics.
-
-    Args:
-        filepath: Directory path containing Business Report files
-        products: List of Product objects to update
-        region: Target region for data processing
-        is_update: Whether to process update data or ongoing data
-    """
-    if not is_update:
-        # Load and process current business report data
-        filename = f'{filepath}{region.name}_{DEFAULT_BUSINESS_REPORT_FILENAME}'
-        # load_business_data(filename, products)
-        # add_business_data(products, region)
-    else:
-        # Load and process business report update data
-        filename = f'{filepath}{region.name}_{DEFAULT_BUSINESS_REPORT_UPDATE_FILENAME}'
-        # load_business_data(filename, products, is_update)
-        # add_real_units(products, region)
-
-
-def process_business_data(args, filepath: str, products: list[Product], region: Region):
+def process_business(args, filepath: Path, products: list[Product], region: Region) -> None:
     """
     Conditionally process Amazon Business Report data based on command line arguments.
 
@@ -92,49 +103,32 @@ def process_business_data(args, filepath: str, products: list[Product], region: 
         products: List of Product objects
         region: Target region for processing
     """
-    if args.business or not any([args.sellerboard, args.helium, args.campaigns, args.sns]):
-        if args.ongoing or not args.update:
-            update_business_data(filepath, products, region, False)
-        if args.update or not args.ongoing:
-            update_business_data(filepath, products, region, True)
+    if not (args.business or not any([args.sellerboard, args.helium, args.campaigns, args.sns])):
+        return
+
+    if args.ongoing or not args.update:
+        _run_phase(
+            region,
+            "BR current",
+            lambda: business.load_current_data(
+                filepath.joinpath(f"{region.value}_{DEFAULT_BUSINESS_REPORT_FILENAME}"),
+                products,
+            ),
+            lambda: spreadsheets.add_current_business_data(products, region),
+        )
+    if args.update or not args.ongoing:
+        _run_phase(
+            region,
+            "BR historical",
+            lambda: business.load_historical_data(
+                filepath.joinpath(f"{region.value}_{DEFAULT_BUSINESS_REPORT_UPDATE_FILENAME}"),
+                products,
+            ),
+            lambda: spreadsheets.add_historical_business_data(products, region),
+        )
 
 
-def process_campaigns_data(args, filepath: str, products: list[Product], region: Region):
-    """
-    Process Amazon PPC campaigns data for advertising performance.
-
-    Args:
-        args: Parsed command line arguments
-        filepath: Directory path for campaign data files
-        products: List of Product objects
-        region: Target region for processing
-    """
-    if args.campaigns or not any([args.sellerboard, args.business, args.helium, args.sns]):
-        pass
-        # filename = f'{filepath}{region.name}_{DEFAULT_CAMPAIGNS_FILENAME}'
-        # load_campaigns_data(filename, products)
-        # add_amazon_campaign_data(products, region)
-
-
-def process_helium_data(args, products: list[Product], region: Region, target_date: str):
-    """
-    Process Helium 10 keyword ranking and weekly performance data.
-
-    Args:
-        args: Parsed command line arguments
-        products: List of Product objects
-        region: Target region for processing
-        target_date: Target date for data processing
-    """
-    if args.helium or not any([args.sellerboard, args.business, args.campaigns, args.sns]):
-        pass
-        # products_to_update = products_with_sheet_title(products)
-        # update_keywords(products_to_update, region)
-        # load_weekly_data(products_to_update, str_to_date(target_date))
-        # add_helium_data(products_to_update, region)
-
-
-def process_sns_data(args, filepath: Path, products: list[Product], region: Region):
+def process_sns(args, filepath: Path, products: list[Product], region: Region) -> None:
     """
     Process Amazon Subscribe & Save performance data.
 
@@ -144,19 +138,104 @@ def process_sns_data(args, filepath: Path, products: list[Product], region: Regi
        products: List of Product objects
        region: Target region for processing
     """
-    if args.sns or not any([args.sellerboard, args.business, args.campaigns, args.helium]):
-        performance_file = filepath.joinpath(f"{region.value}_{DEFAULT_SNS_PERFORMANCE_FILENAME}")
-        products_file = filepath.joinpath(f"{region.value}_{DEFAULT_SNS_PRODUCTS_FILENAME}")
-        load_sns_data(performance_file, products_file, products)
+    if not (args.sns or not any([args.sellerboard, args.business, args.campaigns, args.helium])):
+        return
+
+    performance_file = filepath.joinpath(f"{region.value}_{DEFAULT_SNS_PERFORMANCE_FILENAME}")
+    products_file = filepath.joinpath(f"{region.value}_{DEFAULT_SNS_PRODUCTS_FILENAME}")
+    _run_phase(
+        region,
+        "SNS",
+        lambda: sns.load_sns_data(performance_file, products_file, products),
+        lambda: spreadsheets.add_sns_data(products, region),
+    )
+
+
+def process_campaigns(args, filepath: Path, products: list[Product], region: Region):
+    """
+    Process Amazon PPC campaigns data for advertising performance.
+
+    Args:
+        args: Parsed command line arguments
+        filepath: Directory path for campaign data files
+        products: List of Product objects
+        region: Target region for processing
+    """
+    if not (args.campaigns or not any([args.sellerboard, args.business, args.helium, args.sns])):
+        return
+
+    _run_phase(
+        region,
+        "PPC",
+        lambda: campaign.load_campaigns(
+            filepath.joinpath(f"{region.value}_{DEFAULT_CAMPAIGNS_FILENAME}"), products,
+        ),
+        lambda: spreadsheets.add_amazon_campaigns_data(products, region),
+    )
+
+
+def process_helium(args, products: list[Product], region: Region, target_date: str):
+    """
+    Process Helium 10 keyword ranking and weekly performance data.
+
+    Args:
+        args: Parsed command line arguments
+        products: List of Product objects
+        region: Target region for processing
+        target_date: Target date for data processing
+    """
+    if not (args.helium or not any([args.sellerboard, args.business, args.campaigns, args.sns])):
+        return
+
+    products_to_update = [product for product in products if product.sheet_title]
+    if _run_phase(
+        region,
+        "H10 keywords",
+        lambda: helium.update_keywords(products_to_update, region),
+        None,
+    ):
+        _run_phase(
+            region,
+            "H10 ranks",
+            lambda: helium.load_weekly_rank_data(products_to_update, target_date),
+            lambda: spreadsheets.add_helium_data(products_to_update, region),
+        )
 
 
 def main():
     args = parse_arguments()
-    products = load_products(Region.uk)
-    # target_date = get_tuesday_target_date()
-    # assign_update_row_numbers(products, Region.uk, target_date)
-    process_sns_data(args, DEFAULT_FILEPATH, products, Region.uk)
-    print(products)
+
+    target_date = args.date if args.date else get_tuesday_target_date(announce=True)
+    filepath = Path(args.filepath) if args.filepath else DEFAULT_FILEPATH
+    regions = [Region(r) for r in args.region] if args.region else list(Region)
+
+    info(f"Starting Weekly Monitor for {len(regions)} region(s) → {filepath}")
+    for region in regions:
+        info(f"--- Region {region.value} ---")
+        try:
+            products = load_products(region)
+        except Exception as e:
+            err(f"Failed to load products for {region.value}: {e}")
+            traceback.print_exc()
+            continue
+
+        try:
+            with StepTimer(f"[{region.value}] Assign row numbers"):
+                spreadsheets.assign_update_row_numbers(products, region, target_date)
+        except Exception as e:
+            err(f"Row assignment failed for {region.value}: {e}")
+            traceback.print_exc()
+            continue
+
+        process_sellerboard(args, filepath, products, region)
+        process_business(args, filepath, products, region)
+        if region.value in {"uk", "fr", "it", "es", "de"}:
+            process_sns(args, filepath, products, region)
+            process_campaigns(args, filepath, products, region)
+            process_helium(args, products, region, target_date)
+
+        ok(f"Region {region.value} completed")
+    info("All regions processed.")
 
 
 if __name__ == "__main__":
